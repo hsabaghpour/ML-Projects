@@ -1,6 +1,7 @@
 # write for me a code that shows how to use liner regression to predict the price of a house
 # given the size of the house in square feet. The data is in the file house_price.csv
 # and the first column is the size of the house and the second column is the price of the house.
+#this is my 1st trial
 
 import pandas as pd
 import numpy as np
