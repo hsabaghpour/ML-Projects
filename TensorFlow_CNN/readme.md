@@ -7,7 +7,6 @@ TensorFlow
 Other dependencies (see requirements.txt)
 Installation
 Clone the repository.
-Install dependencies: pip install -r requirements.txt.
 Run the code: python your_script.py.
 Usage
 Modify the code as needed for your dataset and model requirements.
