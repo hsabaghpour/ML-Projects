@@ -3,10 +3,14 @@ import numpy as np
 from geopy.distance import geodesic
 from sklearn.cluster import DBSCAN
 import matplotlib.pyplot as plt
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.linear_model import LinearRegression
+import datetime
 
 # Load the data from a CSV file
-data = pd.read_csv('network_kpi_data.csv', parse_dates=['date'])
+data = pd.read_csv('network_kpi_data.csv')
+
+# Ensure the date column is in datetime format
+data['date'] = pd.to_datetime(data['date'])
 
 # Define the threshold values for degraded KPIs
 thresholds = {
@@ -16,36 +20,16 @@ thresholds = {
     'accessibility': 95.0   # percentage
 }
 
-# Aggregation functions
-def aggregate_data(df, freq):
-    return df.resample(freq, on='date').mean()
+# Identify the worst-performing cells based on the thresholds
+worst_cells = data[
+    (data['call_drop_rate'] > thresholds['call_drop_rate']) |
+    (data['availability'] < thresholds['availability']) |
+    (data['throughput'] < thresholds['throughput']) |
+    (data['accessibility'] < thresholds['accessibility'])
+]
 
-# Detect degradation compared to last period
-def detect_degradation(current, previous):
-    return current > previous
-
-# Predict traffic growth using Holt-Winters Exponential Smoothing
-def predict_traffic(data, steps):
-    model = ExponentialSmoothing(data, trend='add', seasonal='add', seasonal_periods=12).fit()
-    forecast = model.forecast(steps)
-    return forecast
-
-# Plotting functions
-def plot_kpis(data, title):
-    data.plot(figsize=(12, 6))
-    plt.title(title)
-    plt.xlabel('Date')
-    plt.ylabel('Values')
-    plt.show()
-
-# Identify worst-performing cells
-def identify_worst_cells(data):
-    return data[
-        (data['call_drop_rate'] > thresholds['call_drop_rate']) |
-        (data['availability'] < thresholds['availability']) |
-        (data['throughput'] < thresholds['throughput']) |
-        (data['accessibility'] < thresholds['accessibility'])
-    ]
+# Extract the geographical coordinates of the worst-performing cells
+coordinates = worst_cells[['latitude', 'longitude']].values
 
 # Function to calculate the distance matrix
 def calculate_distance_matrix(locations):
@@ -55,63 +39,99 @@ def calculate_distance_matrix(locations):
             distance_matrix[i, j] = geodesic(loc1, loc2).kilometers
     return distance_matrix
 
-# Perform geographical clustering
-def geographical_clustering(coordinates):
-    distance_matrix = calculate_distance_matrix(coordinates)
-    dbscan = DBSCAN(eps=2, min_samples=2, metric='precomputed')
-    labels = dbscan.fit_predict(distance_matrix)
-    return labels
+# Calculate the distance matrix for the worst-performing cells
+distance_matrix = calculate_distance_matrix(coordinates)
 
-# Aggregate data to daily, weekly, and monthly levels
-daily_data = aggregate_data(data, 'D')
-weekly_data = aggregate_data(data, 'W')
-monthly_data = aggregate_data(data, 'M')
+# Perform DBSCAN clustering with a maximum distance of 2 km
+dbscan = DBSCAN(eps=2, min_samples=2, metric='precomputed')
+labels = dbscan.fit_predict(distance_matrix)
 
-# Detect degradation
-last_week = weekly_data.iloc[-2]
-current_week = weekly_data.iloc[-1]
-degradation = detect_degradation(current_week, last_week)
-
-# Predict traffic growth for the next month
-traffic_forecast = predict_traffic(weekly_data['throughput'], steps=4)
-
-# Identify worst-performing cells
-worst_cells = identify_worst_cells(data)
-
-# Extract coordinates of worst-performing cells
-coordinates = worst_cells[['latitude', 'longitude']].values
-
-# Perform geographical clustering
-labels = geographical_clustering(coordinates)
-
-# Add cluster labels to worst-performing cells
+# Add the cluster labels to the worst-performing cells DataFrame
 worst_cells['cluster'] = labels
 
-# Label top offenders
+# Label the top offenders (worst-performing and geographically correlated cells)
 worst_cells['top_offender'] = worst_cells['cluster'] != -1
 
-# Merge top offender labels back into the original data
+# Merge the top offender labels back into the original data
 data = data.merge(worst_cells[['cell_id', 'top_offender']], on='cell_id', how='left')
 data['top_offender'] = data['top_offender'].fillna(False)
 
-# Save results to CSV
-data.to_csv('top_offenders_with_geographical_correlation.csv', index=False)
+# Aggregation to daily, weekly, and monthly levels
+data['date'] = pd.to_datetime(data['date'])
+daily_data = data.groupby([data['date'].dt.date, 'cell_id']).mean().reset_index()
+weekly_data = data.groupby([data['date'].dt.to_period('W').apply(lambda r: r.start_time), 'cell_id']).mean().reset_index()
+monthly_data = data.groupby([data['date'].dt.to_period('M').apply(lambda r: r.start_time), 'cell_id']).mean().reset_index()
 
-# Plot aggregated data and forecast
-plot_kpis(daily_data[['call_drop_rate', 'availability', 'throughput', 'accessibility']], 'Daily KPI Trends')
-plot_kpis(weekly_data[['call_drop_rate', 'availability', 'throughput', 'accessibility']], 'Weekly KPI Trends')
-plot_kpis(monthly_data[['call_drop_rate', 'availability', 'throughput', 'accessibility']], 'Monthly KPI Trends')
-plot_kpis(traffic_forecast, 'Predicted Traffic Growth for Next Month')
+# Compare the data to see if there are any degradations compared to the last week
+def compare_weeks(data):
+    data['week'] = data['date'].dt.to_period('W').apply(lambda r: r.start_time)
+    current_week = data['week'].max()
+    previous_week = current_week - pd.Timedelta(weeks=1)
 
-# Plot geographical clusters of top offenders
-top_offenders = data[data['top_offender']]
-plt.figure(figsize=(10, 6))
-plt.scatter(data['longitude'], data['latitude'], c='grey', alpha=0.5, label='All Sites')
-plt.scatter(top_offenders['longitude'], top_offenders['latitude'], c='red', label='Top Offenders')
-plt.xlabel('Longitude')
-plt.ylabel('Latitude')
-plt.title('Geographically Correlated Top Offenders')
+    current_week_data = data[data['week'] == current_week]
+    previous_week_data = data[data['week'] == previous_week]
+
+    comparison = current_week_data.set_index('cell_id').subtract(previous_week_data.set_index('cell_id'), fill_value=0)
+    return comparison
+
+weekly_comparison = compare_weeks(data)
+
+# Plotting functions
+def plot_kpis_over_time(data, title):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for kpi in ['call_drop_rate', 'availability', 'throughput', 'accessibility']:
+        ax.plot(data['date'], data[kpi], label=kpi)
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Value')
+    ax.set_title(title)
+    ax.legend()
+    plt.show()
+
+plot_kpis_over_time(daily_data, 'Daily KPI Trends')
+plot_kpis_over_time(weekly_data, 'Weekly KPI Trends')
+plot_kpis_over_time(monthly_data, 'Monthly KPI Trends')
+
+# Traffic growth prediction and alert for capacity expansion
+def predict_traffic_growth(data):
+    data['timestamp'] = data['date'].apply(lambda x: x.timestamp())
+    X = data[['timestamp']]
+    y = data['throughput']
+
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    future_dates = pd.date_range(start=data['date'].max(), periods=30, freq='D')
+    future_timestamps = future_dates.map(lambda x: x.timestamp()).reshape(-1, 1)
+    future_predictions = model.predict(future_timestamps)
+
+    return future_dates, future_predictions
+
+future_dates, future_predictions = predict_traffic_growth(data)
+
+# Plot traffic growth predictions
+plt.figure(figsize=(12, 6))
+plt.plot(data['date'], data['throughput'], label='Historical Throughput')
+plt.plot(future_dates, future_predictions, label='Predicted Throughput', linestyle='--')
+plt.xlabel('Date')
+plt.ylabel('Throughput (Mbps)')
+plt.title('Traffic Growth Prediction')
 plt.legend()
 plt.show()
 
-print("Analysis complete! Results saved to 'top_offenders_with_geographical_correlation.csv'.")
+# Alerting for capacity expansion
+def check_capacity_expansion(predictions, threshold=15):
+    if np.any(predictions > threshold):
+        print("Alert: Predicted traffic growth exceeds capacity threshold! Consider expanding capacity.")
+    else:
+        print("No capacity expansion needed based on predicted traffic growth.")
+
+check_capacity_expansion(future_predictions)
+
+# Save the results to a new CSV file
+data.to_csv('top_offenders_with_geographical_correlation.csv', index=False)
+daily_data.to_csv('daily_data.csv', index=False)
+weekly_data.to_csv('weekly_data.csv', index=False)
+monthly_data.to_csv('monthly_data.csv', index=False)
+weekly_comparison.to_csv('weekly_comparison.csv', index=False)
+
+print("All analyses have been completed and results saved to CSV files.")
